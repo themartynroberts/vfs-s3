@@ -79,7 +79,7 @@ public class S3FileObject extends AbstractFileObject {
     }
 
     @Override
-    protected void doAttach() {
+    protected synchronized void doAttach() {
         if (!attached) {
             try {
                 // Do we have file with name?
@@ -121,7 +121,7 @@ public class S3FileObject extends AbstractFileObject {
     }
 
     @Override
-    protected void doDetach() {
+    protected synchronized void doDetach() {
         if (attached) {
             logger.info("Detach from S3 Object: " + objectKey);
             objectMetadata = null;
@@ -187,14 +187,6 @@ public class S3FileObject extends AbstractFileObject {
     protected OutputStream doGetOutputStream(boolean bAppend) throws Exception {
         // TODO: get file size of upload prior to performing upload
         return upload(null);
-    }
-
-    final Map<String, Object> attrs = new HashMap<>();
-
-    @Override
-    protected Map<String, Object> doGetAttributes() throws Exception
-    {
-        return attrs;
     }
 
     @Override
