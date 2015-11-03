@@ -1,15 +1,17 @@
 package com.intridea.io.vfs.provider.s3;
 
-import com.amazonaws.AmazonClientException;
 import com.amazonaws.AmazonServiceException;
 import com.amazonaws.auth.AWSCredentials;
+import com.amazonaws.event.ProgressEvent;
+import com.amazonaws.event.ProgressEventType;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.Headers;
 import com.amazonaws.services.s3.internal.Mimetypes;
 import com.amazonaws.services.s3.model.*;
+import com.amazonaws.services.s3.transfer.PersistableTransfer;
 import com.amazonaws.services.s3.transfer.TransferManager;
-import com.amazonaws.services.s3.transfer.TransferManagerConfiguration;
-import com.amazonaws.services.s3.transfer.Upload;
+import com.amazonaws.services.s3.transfer.internal.S3ProgressListener;
+import com.amazonaws.util.IOUtils;
 import com.intridea.io.vfs.operations.Acl;
 import com.intridea.io.vfs.operations.IAclGetter;
 import org.apache.commons.logging.Log;
@@ -18,14 +20,12 @@ import org.apache.commons.vfs2.*;
 import org.apache.commons.vfs2.provider.AbstractFileName;
 import org.apache.commons.vfs2.provider.AbstractFileObject;
 import org.apache.commons.vfs2.provider.LockByFileStrategyFactory;
-import org.apache.commons.vfs2.util.MonitorOutputStream;
+import org.apache.commons.vfs2.util.MonitorInputStream;
 
 import java.io.*;
 import java.net.URISyntaxException;
-import java.nio.channels.Channels;
-import java.nio.channels.FileChannel;
-import java.nio.channels.ReadableByteChannel;
 import java.util.*;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -34,7 +34,6 @@ import static com.amazonaws.services.s3.model.ObjectMetadata.AES_256_SERVER_SIDE
 import static com.intridea.io.vfs.operations.Acl.Permission.READ;
 import static com.intridea.io.vfs.operations.Acl.Permission.WRITE;
 import static com.intridea.io.vfs.provider.s3.AmazonS3ClientHack.extractCredentials;
-import static java.nio.channels.Channels.newInputStream;
 import static java.util.Calendar.SECOND;
 import static org.apache.commons.vfs2.FileName.SEPARATOR;
 import static org.apache.commons.vfs2.NameScope.CHILD;
@@ -65,25 +64,14 @@ public class S3FileObject extends AbstractFileObject {
     private boolean attached = false;
 
     /**
-     * True when content downloaded.
-     * It's an extended flag to <code>attached</code>.
-     */
-    private boolean downloaded = false;
-
-    /**
-     * Local cache of file content
-     */
-    private File cacheFile;
-
-    /**
-     * Local for output stream
-     */
-    private File outputFile;
-
-    /**
      * Amazon file owner. Used in ACL
      */
     private Owner fileOwner;
+
+    /**
+     * Count down latch to support a blocking exists() call during uploads
+     */
+    private CountDownLatch uploading;
 
     public S3FileObject(AbstractFileName fileName,
                         S3FileSystem fileSystem) throws FileSystemException {
@@ -104,9 +92,6 @@ public class S3FileObject extends AbstractFileObject {
                 return;
             } catch (AmazonServiceException e) {
                 // No, we don't
-            }
-            catch (AmazonClientException e) {
-                // We are attempting to attach to the root bucket
             }
 
             try {
@@ -130,24 +115,16 @@ public class S3FileObject extends AbstractFileObject {
 
                 logger.info("Attach new S3 Object: " + objectKey);
 
-                downloaded = true;
                 attached = true;
             }
         }
     }
 
     @Override
-    protected void doDetach() throws Exception {
+    protected void doDetach() {
         if (attached) {
             logger.info("Detach from S3 Object: " + objectKey);
             objectMetadata = null;
-            if (cacheFile != null) {
-                if (!cacheFile.delete()) {
-                    logger.error("Unable to delete temporary file: " + cacheFile.getPath());
-                }
-                cacheFile = null;
-            }
-            downloaded = false;
             attached = false;
         }
     }
@@ -202,13 +179,22 @@ public class S3FileObject extends AbstractFileObject {
 
     @Override
     protected InputStream doGetInputStream() throws Exception {
-        downloadOnce();
-        return newInputStream(getCacheFileChannel());
+        S3Object s3Object = getService().getObject(getBucket().getName(), objectKey);
+        return new S3InputStream(s3Object);
     }
 
     @Override
     protected OutputStream doGetOutputStream(boolean bAppend) throws Exception {
-        return new S3OutputStream(Channels.newOutputStream(getOutputFileChannel()));
+        // TODO: get file size of upload prior to performing upload
+        return upload(null);
+    }
+
+    final Map<String, Object> attrs = new HashMap<>();
+
+    @Override
+    protected Map<String, Object> doGetAttributes() throws Exception
+    {
+        return attrs;
     }
 
     @Override
@@ -344,66 +330,6 @@ public class S3FileObject extends AbstractFileObject {
     // Utility methods
 
     /**
-     * Download S3 object content and save it in temporary file.
-     * Do it only if object was not already downloaded.
-     */
-    private void downloadOnce() throws FileSystemException {
-        if (!downloaded) {
-            final String objectPath = getName().getPath();
-
-            S3Object obj = null;
-
-            try {
-                obj = getService().getObject(getBucket().getName(), objectKey);
-
-                logger.info(String.format("Downloading S3 Object: %s", objectPath));
-
-                if (obj.getObjectMetadata().getContentLength() > 0) {
-                    InputStream is = obj.getObjectContent();
-
-                    ReadableByteChannel rbc = null;
-                    FileChannel cacheFc = null;
-
-                    try {
-                        rbc = Channels.newChannel(is);
-                        cacheFc = getCacheFileChannel();
-
-                        cacheFc.transferFrom(rbc, 0, obj.getObjectMetadata().getContentLength());
-                    } finally {
-                        if (rbc != null) {
-                            try {
-                                rbc.close();
-                            } catch (IOException e) {
-                            }
-                        }
-
-                        if (cacheFc != null) {
-                            try {
-                                cacheFc.close();
-                            } catch (IOException e) {
-                            }
-                        }
-                    }
-                }
-            } catch (AmazonServiceException | IOException e) {
-                final String failedMessage = "Failed to download S3 Object %s. %s";
-
-                throw new FileSystemException(String.format(failedMessage, objectPath, e.getMessage()), e);
-            } finally {
-                if (obj != null) {
-                    try {
-                        obj.close();
-                    } catch (IOException e) {
-                        logger.warn("Not able to close S3 object [" + objectPath + "]", e);
-                    }
-                }
-            }
-
-            downloaded = true;
-        }
-    }
-
-    /**
      * Same as in Jets3t library, to be compatible.
      */
     private boolean isDirectoryPlaceholder() {
@@ -452,30 +378,6 @@ public class S3FileObject extends AbstractFileObject {
         } else {
             return path.substring(1);
         }
-    }
-
-    /**
-     * Get or create temporary file channel for file cache
-     * @return temporary file channel for file cache
-     * @throws IOException
-     */
-    private FileChannel getCacheFileChannel() throws IOException {
-        if (cacheFile == null) {
-            cacheFile = File.createTempFile("scalr.", ".s3");
-        }
-        return new RandomAccessFile(cacheFile, "rw").getChannel();
-    }
-
-    /**
-     * Get or create temporary file channel for file output cache
-     * @return temporary file channel for file output cache
-     * @throws IOException
-     */
-    private FileChannel getOutputFileChannel() throws IOException {
-        if (outputFile == null) {
-            outputFile = File.createTempFile("scalr.", ".s3");
-        }
-        return new RandomAccessFile(outputFile, "rw").getChannel();
     }
 
     // ACL extension methods
@@ -747,19 +649,6 @@ public class S3FileObject extends AbstractFileObject {
         }
     }
 
-    /**
-     * Returns file that was used as local cache. Useful to do something with local tools like image resizing and so on
-     *
-     * @return absolute path to file or nul if nothing were downloaded
-     */
-    public String getCacheFile() {
-        if (downloaded && (cacheFile != null)) {
-            return cacheFile.getAbsolutePath();
-        }
-
-        return null;
-    }
-
     protected AmazonS3 getService() {
         return ((S3FileSystem)getFileSystem()).getService();
     }
@@ -767,40 +656,6 @@ public class S3FileObject extends AbstractFileObject {
     /** Amazon S3 bucket */
     protected Bucket getBucket() {
         return ((S3FileSystem)getFileSystem()).getBucket();
-    }
-
-    /**
-     * Special JetS3FileObject output stream.
-     * It saves all contents in temporary file, onClose sends contents to S3.
-     *
-     * @author Marat Komarov
-     */
-    private class S3OutputStream extends MonitorOutputStream {
-        public S3OutputStream(OutputStream out) {
-            super(out);
-        }
-
-        @Override
-        protected void onClose() throws IOException {
- 			doAttach();
-            try {
-                upload(outputFile);
-            } catch (AmazonServiceException e) {
-                throw new IOException(e);
-            } catch (Exception e) {
-                throw new IOException(e);
-            } finally {
-                if (!attached) {
-                    if (!outputFile.delete()) {
-                        logger.error("Unable to delete temporary file: " + outputFile.getName());
-                    }
-                } else {
-                    cacheFile = outputFile;
-                    downloaded = true;
-                }
-                outputFile = null;
-            }
-        }
     }
 
     /**
@@ -873,10 +728,12 @@ public class S3FileObject extends AbstractFileObject {
                     }
                     getService().copyObject(copy);
                 } else if (srcFile.getType().hasContent() && srcFile.getURL().getProtocol().equals("file")) {
-                    // do direct upload from file to avoid overhead of making a copy of the file
                     try {
                         File localFile = new File(srcFile.getURL().toURI());
-                        destFile.upload(localFile);
+                        OutputStream os = destFile.upload(localFile.length());
+                        InputStream is = new FileInputStream(localFile);
+                        IOUtils.copy(is, os);
+                        exists();
                     } catch (URISyntaxException e) {
                         // couldn't convert URL to URI, but should still be able to do the slower way
                         super.copyFrom(file, selector);
@@ -885,9 +742,7 @@ public class S3FileObject extends AbstractFileObject {
                     super.copyFrom(file, selector);
                 }
 			} catch (IOException e) {
-				throw new FileSystemException("vfs.provider/copy-file.error", new Object[]{srcFile, destFile}, e);
-			} catch (AmazonClientException e) {
-				throw new FileSystemException("vfs.provider/copy-file.error", new Object[]{srcFile, destFile}, e);
+				throw new FileSystemException("vfs.provider/copy-file.error", e, srcFile, destFile);
 			} finally {
 				destFile.close();
 			}
@@ -917,44 +772,79 @@ public class S3FileObject extends AbstractFileObject {
     /**
      * Uploads File to S3
      *
-     * @param file the File
+     * @param size the Size of the data upload
      */
-    private void upload(File file) throws IOException {
-        PutObjectRequest request = new PutObjectRequest(getBucket().getName(), getS3Key(), file);
+    private OutputStream upload(Long size) throws IOException {
+        uploading = new CountDownLatch(1);
 
         ObjectMetadata md = new ObjectMetadata();
-        md.setContentLength(file.length());
+
+        if (size != null) {
+            md.setContentLength(size);
+        }
+
         md.setContentType(Mimetypes.getInstance().getMimetype(getName().getBaseName()));
         // set encryption if needed
         if (getServerSideEncryption()) {
             md.setSSEAlgorithm(AES_256_SERVER_SIDE_ENCRYPTION);
         }
 
-        request.setMetadata(md);
-        try {
-            TransferManagerConfiguration tmConfig = new TransferManagerConfiguration();
-            // if length is below multi-part threshold, just use put, otherwise create and use a TransferManager
-            if (md.getContentLength() < tmConfig.getMultipartUploadThreshold()) {
-                getService().putObject(request);
-            } else {
-                TransferManager transferManager = new TransferManager(getService(), createTransferManagerExecutorService());
-                try {
-                    Upload upload = transferManager.upload(request);
-                    upload.waitForCompletion();
-                } finally {
+        PipedInputStream pin = new PipedInputStream();
+        PipedOutputStream pout = new PipedOutputStream(pin);
+
+        final PutObjectRequest request = new PutObjectRequest(getBucket().getName(), getS3Key(), pin, md);
+
+        final TransferManager transferManager = new TransferManager(getService(), createTransferManagerExecutorService());
+        transferManager.upload(request, new S3ProgressListener() {
+            @Override
+            public void onPersistableTransfer(PersistableTransfer persistableTransfer) {
+                // empty
+            }
+            @Override
+            public void progressChanged(ProgressEvent progressEvent) {
+                if (progressEvent.getEventType() == ProgressEventType.TRANSFER_COMPLETED_EVENT
+                    || progressEvent.getEventType() == ProgressEventType.TRANSFER_FAILED_EVENT) {
                     transferManager.shutdownNow(false);
+                    doDetach();
+                    doAttach();
+                    uploading.countDown();
                 }
             }
-            doDetach();
-            doAttach();
-        } catch (InterruptedException e) {
-            throw new InterruptedIOException();
-        } catch (Exception e) {
-            throw e instanceof IOException ? (IOException) e : new IOException(e);
-        }
+        });
+        return pout;
     }
 
     private boolean getServerSideEncryption() {
         return S3FileSystemConfigBuilder.getInstance().getServerSideEncryption(getFileSystem().getFileSystemOptions());
+    }
+
+    @Override
+    public boolean exists() throws FileSystemException {
+        try {
+            if (uploading != null) {
+                uploading.await();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        return super.exists();
+    }
+
+    static class S3InputStream extends MonitorInputStream {
+        private final S3Object s3Object;
+
+        public S3InputStream(final S3Object s3Object) throws IOException {
+            super(s3Object.getObjectContent());
+            this.s3Object = s3Object;
+        }
+
+        /**
+         * Called after the stream has been closed.
+         */
+        @Override
+        protected void onClose() throws IOException {
+            s3Object.close();
+        }
     }
 }

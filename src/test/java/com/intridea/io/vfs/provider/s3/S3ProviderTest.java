@@ -170,8 +170,7 @@ public class S3ProviderTest {
         dest.copyFrom(src, Selectors.SELECT_SELF);
 
         assertTrue(dest.exists() && dest.getType().equals(FileType.FILE));
-        assertEquals(((S3FileObject)dest).getObjectMetadata().getServerSideEncryption(),
-            null);
+        assertEquals(((S3FileObject)dest).getObjectMetadata().getSSEAlgorithm(), null);
     }
 
     @Test(dependsOnMethods = {"createEncryptedFileOk"})
@@ -217,7 +216,7 @@ public class S3ProviderTest {
 
         // copy twice
         dest.copyFrom(src, Selectors.SELECT_SELF);
-        Thread.sleep(2000L);
+        dest.exists();
         dest.copyFrom(src, Selectors.SELECT_SELF);
 
         assertTrue(dest.exists() && dest.getType().equals(FileType.FILE));
@@ -264,13 +263,13 @@ public class S3ProviderTest {
         OutputStream os = dest.getContent().getOutputStream();
         try {
             os.write(BACKUP_ZIP.getBytes("US-ASCII"));
+            os.flush();
         } finally {
             os.close();
         }
         assertTrue(dest.exists() && dest.getType().equals(FileType.FILE));
         assertEquals(dest.getContent().getSize(), BACKUP_ZIP.length());
-        assertEquals(((S3FileObject)dest).getObjectMetadata().getServerSideEncryption(),
-                null);
+        assertEquals(((S3FileObject)dest).getObjectMetadata().getSSEAlgorithm(), null);
         BufferedReader reader = new BufferedReader(new InputStreamReader(dest.getContent().getInputStream(), "US-ASCII"));
         try {
             assertEquals(reader.readLine(), BACKUP_ZIP);
@@ -336,6 +335,7 @@ public class S3ProviderTest {
         for (int i=0; i<5; i++) {
             FileObject tmpFile = fsManager.resolveFile(baseDir, i + ".tmp");
             tmpFile.createFile();
+            tmpFile.exists();
         }
 
         FileObject[] children = baseDir.getChildren();
